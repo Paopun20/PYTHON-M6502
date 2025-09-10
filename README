@@ -53,6 +53,16 @@ Ready.
 - This is a port of Microsoft's BASIC-M6502 with ongoing bug fixes.
 - Known issues: Some type handling in `READ` and `PRINT` may need refinement.
 - Report bugs or contribute fixes via pull requests.
+- BEST TO DO, pull requests with bug fixes, new features, or documentation improvements are welcome.
+
+## Contributing
+Contributions are welcome! Please follow these steps:
+1. Fork the repository.
+2. Create a new branch for your feature or bug fix.
+3. Make your changes and ensure tests pass.
+4. Commit your changes with a clear message.
+5. Push your branch to your fork.
+6. Open a pull request to the `main` branch of this repository.
 
 ## License
 This project is licensed under the MIT License, as per the original [BASIC-M6502](https://github.com/microsoft/BASIC-M6502/) repository. See `LICENSE` for details.
