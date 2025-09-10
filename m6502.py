@@ -1,46 +1,80 @@
 import re
 import sys
+import math
+import os
+import array
+import logging
 
-VARS = {chr(65 + i): 0.0 for i in range(26)}
-ARRAYS = {}  # For DIM arrays
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.traceback import install
+install()
+Console().clear()
+
+file_handler = logging.FileHandler("m6502.log", mode="w")  # overwrite each run
+file_handler.setLevel(logging.DEBUG)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    handlers=[
+        RichHandler(
+            rich_tracebacks=True,
+            show_time=True,
+            show_level=True,
+            show_path=True,
+        ),
+        file_handler
+    ]
+)
+
+logger = logging.getLogger("M6502")
+
+VARS = {chr(65 + i): 0.0 for i in range(26)}  # Numeric variables
+STR_VARS = {chr(65 + i) + '$': '' for i in range(26)}  # String variables
+ARRAYS = {}  # Numeric arrays
+STR_ARRAYS = {}  # String arrays
 LINES = {}  # line_num -> tokenized line
 DATA_PTR = 0  # For RESTORE and READ
 DATA_LINES = []  # Flattened data tokens
+GOSUB_STACK = []
+FOR_STACK = []
+MAX_STACK_DEPTH = 100
+TERM_WIDTH = os.get_terminal_size().columns if hasattr(os, 'get_terminal_size') else 80
 
 TOKENS = {
     'PRINT': 160, 'LET': 161, 'GOTO': 162, 'IF': 163, 'THEN': 164,
     'INPUT': 165, 'END': 166, '+': 167, '-': 168, '*': 169, '/': 170,
     '=': 171, '<': 172, '>': 173, ',': 174, ';': 175, '(': 176, ')': 177,
     'DIM': 178, 'READ': 179, 'RESTORE': 180, 'DATA': 181, 'REM': 182,
-    'FOR': 183, 'TO': 184, 'STEP': 185, 'NEXT': 186, 'GOSUB': 187, 'RETURN': 188
+    'FOR': 183, 'TO': 184, 'STEP': 185, 'NEXT': 186, 'GOSUB': 187, 'RETURN': 188,
+    ':': 189, 'LEFT$': 190, 'RIGHT$': 191, 'MID$': 192, 'LEN': 193, 'CHR$': 194,
+    'ASC': 195, 'SIN': 196, 'COS': 197, 'ABS': 198, 'SQR': 199, 'RND': 200,
+    'PEEK': 201, 'POKE': 202
 }
 KEYWORDS = {v: k for k, v in TOKENS.items() if isinstance(k, str) and k.isupper()}
 SYMBOLS = {v: k for k, v in TOKENS.items() if not (isinstance(k, str) and k.isupper())}
-GOSUB_STACK = []
-FOR_STACK = []
+MEMORY = array.array('B', [0] * 65536)  # Simulated 6502 memory
 
-class BasicError(Exception): pass
+class BasicError(Exception):
+    def __init__(self, message):
+        logger.error(message)
+        super().__init__(message)
 
 def tokenize(line):
-    # Handle string literals properly and preserve case for strings
     parts = []
     i = 0
     while i < len(line):
         if line[i] == '"':
-            # Find closing quote
             j = i + 1
             while j < len(line) and line[j] != '"':
                 j += 1
-            if j < len(line):
-                parts.append(line[i:j+1])  # Include quotes
-                i = j + 1
-            else:
-                parts.append(line[i:])  # Unterminated string
-                break
+            if j >= len(line):
+                raise BasicError("Unterminated string literal")
+            parts.append(line[i:j+1])
+            i = j + 1
         else:
-            # Find next delimiter
             j = i
-            while j < len(line) and line[j] not in ' \t"+-*/=<>;,()':
+            while j < len(line) and line[j] not in ' \t"+-*/=<>;,():':
                 j += 1
             if i < j:
                 parts.append(line[i:j])
@@ -48,48 +82,44 @@ def tokenize(line):
                 parts.append(line[j])
             i = max(j + 1, i + 1)
     
-    # Remove empty parts and spaces
     parts = [p for p in parts if p.strip()]
     
     tokens = []
     for p in parts:
         if p.startswith('"') and p.endswith('"') and len(p) >= 2:
-            tokens.append(p[1:-1])  # Remove quotes, preserve original case
+            tokens.append(p[1:-1])
         elif p.upper() in TOKENS:
             tokens.append(TOKENS[p.upper()])
         elif len(p) == 1 and p.upper().isalpha():
             tokens.append(ord(p.upper()))
+        elif p.upper().endswith('$') and len(p) == 2 and p[0].isalpha():
+            tokens.append(p.upper())
         elif re.match(r'^-?\d+(\.\d+)?$', p):
             tokens.append(float(p))
-        elif p in '+-*/=<>;,()':
+        elif p in '+-*/=<>;,():':
             tokens.append(TOKENS[p])
         else:
-            # Try to parse as identifier or keep as string
             tokens.append(p.upper())
     return tokens
 
 def detokenize(tokens):
     s = ''
     for t in tokens:
-        # Strings
-        if isinstance(t, str) and t not in TOKENS:
+        if isinstance(t, str) and t not in TOKENS and not t.endswith('$'):
             s += f'"{t}" '
-        # Variables A-Z
+        elif isinstance(t, str) and t.endswith('$'):
+            s += t + ' '
         elif isinstance(t, int) and 65 <= t <= 90:
             s += chr(t) + ' '
-        # Keywords
         elif t in KEYWORDS:
             s += KEYWORDS[t] + ' '
-        # Symbols
         elif t in SYMBOLS:
             s += SYMBOLS[t] + ' '
-        # Numeric constants
         elif isinstance(t, float):
             if t.is_integer():
                 s += str(int(t)) + ' '
             else:
                 s += str(t) + ' '
-        # Other tokens
         else:
             s += str(t) + ' '
     return s.strip()
@@ -97,35 +127,33 @@ def detokenize(tokens):
 def parse_line(line):
     global DATA_LINES
     m = re.match(r'^(\d+)\s*(.*)$', line.strip())
-    if not m: 
+    if not m:
         raise BasicError("Line must start with number")
     num = int(m.group(1))
+    if num <= 0:
+        raise BasicError("Line number must be positive")
     
-    # Handle line deletion
     if not m.group(2).strip():
         if num in LINES:
             del LINES[num]
-            # Rebuild DATA_LINES
             DATA_LINES = []
             for line_num in sorted(LINES.keys()):
                 tokens = LINES[line_num]
                 if tokens and tokens[0] == TOKENS['DATA']:
-                    DATA_LINES.extend(tokens[1:])
+                    for token in tokens[1:]:
+                        DATA_LINES.append((token, isinstance(token, str) and not token.endswith('$')))  # String literal check
         return
     
     code = tokenize(m.group(2))
     LINES[num] = code
     
-    # Rebuild DATA_LINES completely
     DATA_LINES = []
     for line_num in sorted(LINES.keys()):
         tokens = LINES[line_num]
         if tokens and tokens[0] == TOKENS['DATA']:
-            DATA_LINES.extend(tokens[1:])
+            for token in tokens[1:]:
+                DATA_LINES.append((token, isinstance(token, str) and not token.endswith('$')))  # String literal check
 
-# --------------------
-# Expression evaluation with precedence
-# --------------------
 def parse_factor(tokens, pos):
     if pos[0] >= len(tokens):
         raise BasicError("Unexpected end of expression")
@@ -137,23 +165,41 @@ def parse_factor(tokens, pos):
         return t
     elif isinstance(t, int) and 65 <= t <= 90:
         var = chr(t)
-        # Check for array access
         if pos[0] < len(tokens) and tokens[pos[0]] == TOKENS['(']:
-            pos[0] += 1  # Skip (
+            pos[0] += 1
             idx_pos = [pos[0]]
             idx = int(parse_expr(tokens, idx_pos))
             pos[0] = idx_pos[0]
             if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
                 raise BasicError("Expected )")
-            pos[0] += 1  # Skip )
-            if var in ARRAYS and 0 <= idx < len(ARRAYS[var]):
+            pos[0] += 1
+            if idx < 0:
+                raise BasicError("Negative array index")
+            if var in ARRAYS and idx < len(ARRAYS[var]):
                 return ARRAYS[var][idx]
             else:
                 raise BasicError(f"Array {var}({idx}) out of bounds")
         return VARS.get(var, 0.0)
+    elif isinstance(t, str) and t.endswith('$'):
+        var = t
+        if pos[0] < len(tokens) and tokens[pos[0]] == TOKENS['(']:
+            pos[0] += 1
+            idx_pos = [pos[0]]
+            idx = int(parse_expr(tokens, idx_pos))
+            pos[0] = idx_pos[0]
+            if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+                raise BasicError("Expected )")
+            pos[0] += 1
+            if idx < 0:
+                raise BasicError("Negative array index")
+            if var in STR_ARRAYS and idx < len(STR_ARRAYS[var]):
+                return STR_ARRAYS[var][idx]
+            else:
+                raise BasicError(f"String array {var}({idx}) out of bounds")
+        return STR_VARS.get(var, '')
     elif t == TOKENS['-']:
         return -parse_factor(tokens, pos)
-    elif t == TOKENS['+']:  # Unary plus
+    elif t == TOKENS['+']:
         return parse_factor(tokens, pos)
     elif t == TOKENS['(']:
         val = parse_expr(tokens, pos)
@@ -161,8 +207,155 @@ def parse_factor(tokens, pos):
             raise BasicError("Expected )")
         pos[0] += 1
         return val
+    elif t in (TOKENS['SIN'], TOKENS['COS'], TOKENS['ABS'], TOKENS['SQR'], TOKENS['RND']):
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        val = parse_expr(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if t == TOKENS['SIN']:
+            return math.sin(val)
+        elif t == TOKENS['COS']:
+            return math.cos(val)
+        elif t == TOKENS['ABS']:
+            return abs(val)
+        elif t == TOKENS['SQR']:
+            if val < 0:
+                raise BasicError("Negative square root")
+            return math.sqrt(val)
+        elif t == TOKENS['RND']:
+            return (val * 1103515245 + 12345) & 0x7fffffff / 0x7fffffff
+    elif t == TOKENS['LEN']:
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        val = parse_string(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        return float(len(val))
+    elif t == TOKENS['ASC']:
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        val = parse_string(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if not val:
+            raise BasicError("Empty string for ASC")
+        return float(ord(val[0]))
+    elif t == TOKENS['PEEK']:
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        addr = int(parse_expr(tokens, pos))
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if 0 <= addr < 65536:
+            return float(MEMORY[addr])
+        raise BasicError("Invalid memory address")
     else:
         raise BasicError(f"Invalid token in expression: {t}")
+
+def parse_string(tokens, pos):
+    if pos[0] >= len(tokens):
+        raise BasicError("Expected string expression")
+    t = tokens[pos[0]]
+    if isinstance(t, str) and not t.endswith('$'):
+        pos[0] += 1
+        return t
+    elif isinstance(t, str) and t.endswith('$'):
+        pos[0] += 1
+        if pos[0] < len(tokens) and tokens[pos[0]] == TOKENS['(']:
+            pos[0] += 1
+            idx_pos = [pos[0]]
+            idx = int(parse_expr(tokens, idx_pos))
+            pos[0] = idx_pos[0]
+            if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+                raise BasicError("Expected )")
+            pos[0] += 1
+            if idx < 0:
+                raise BasicError("Negative array index")
+            if t in STR_ARRAYS and idx < len(STR_ARRAYS[t]):
+                return STR_ARRAYS[t][idx]
+            raise BasicError(f"String array {t}({idx}) out of bounds")
+        return STR_VARS.get(t, '')
+    elif t == TOKENS['CHR$']:
+        pos[0] += 1
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        val = int(parse_expr(tokens, pos))
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if 0 <= val <= 255:
+            return chr(val)
+        raise BasicError("Invalid CHR$ value")
+    elif t == TOKENS['LEFT$']:
+        pos[0] += 1
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        s = parse_string(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[',']:
+            raise BasicError("Expected ,")
+        pos[0] += 1
+        n = int(parse_expr(tokens, pos))
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if n < 0:
+            raise BasicError("Negative length")
+        return s[:n]
+    elif t == TOKENS['RIGHT$']:
+        pos[0] += 1
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        s = parse_string(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[',']:
+            raise BasicError("Expected ,")
+        pos[0] += 1
+        n = int(parse_expr(tokens, pos))
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if n < 0:
+            raise BasicError("Negative length")
+        return s[-n:] if n > 0 else ''
+    elif t == TOKENS['MID$']:
+        pos[0] += 1
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS['(']:
+            raise BasicError("Expected (")
+        pos[0] += 1
+        s = parse_string(tokens, pos)
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[',']:
+            raise BasicError("Expected ,")
+        pos[0] += 1
+        start = int(parse_expr(tokens, pos))
+        if pos[0] < len(tokens) and tokens[pos[0]] == TOKENS[',']:
+            pos[0] += 1
+            length = int(parse_expr(tokens, pos))
+        else:
+            length = None
+        if pos[0] >= len(tokens) or tokens[pos[0]] != TOKENS[')']:
+            raise BasicError("Expected )")
+        pos[0] += 1
+        if start < 1:
+            raise BasicError("Invalid start position")
+        start -= 1
+        if length is None:
+            return s[start:]
+        if length < 0:
+            raise BasicError("Negative length")
+        return s[start:start+length]
+    else:
+        raise BasicError("Expected string expression")
 
 def parse_term(tokens, pos):
     val = parse_factor(tokens, pos)
@@ -242,333 +435,347 @@ def parse_rel(tokens, pos):
         val = -1.0 if cond else 0.0
     return val
 
-def execute_line(tokens):
-    global DATA_PTR, GOSUB_STACK, FOR_STACK
-    i = 0
-    
-    if not tokens:
+def execute_statement(tokens, i_pos):
+    """Execute a single BASIC statement with full logging."""
+    global DATA_PTR, GOSUB_STACK, FOR_STACK, TERM_WIDTH
+    i = i_pos[0]
+    if i >= len(tokens):
         return None
-        
-    while i < len(tokens):
-        tok = tokens[i]
 
-        # REM
-        if tok == TOKENS['REM']:
-            return None
+    tok = tokens[i]
 
-        # PRINT
-        if tok == TOKENS['PRINT']:
-            i += 1
-            output = ""
-            tab_next = False
+    if tok == TOKENS['REM']:
+        logger.debug("REM statement, ignored")
+        i_pos[0] = len(tokens)
+        return None
+
+    elif tok == TOKENS['PRINT']:
+        i += 1
+        output = ""
+        suppress_newline = False
+        zone_width = max(TERM_WIDTH // 5, 14)
+        while i < len(tokens) and tokens[i] != TOKENS[':']:
+            t = tokens[i]
+            if t == TOKENS[',']:
+                output += " " * (zone_width - (len(output) % zone_width))
+                i += 1
+                continue
+            if t == TOKENS[';']:
+                suppress_newline = True
+                i += 1
+                continue
             suppress_newline = False
-            
-            while i < len(tokens):
-                t = tokens[i]
-                if t == TOKENS[',']:
-                    # Tab to next print zone
-                    current_len = len(output) % 14
-                    spaces_needed = 14 - current_len if current_len > 0 else 0
-                    output += " " * spaces_needed
-                    i += 1
-                    continue
-                if t == TOKENS[';']:
-                    # No spacing, just continue
-                    suppress_newline = True
-                    i += 1
-                    continue
-                
-                suppress_newline = False
-                
-                if isinstance(t, str) and t not in TOKENS and not (isinstance(t, int) and 65 <= t <= 90):
-                    # String literal
-                    output += t
-                    i += 1
-                else:
-                    # Expression
-                    pos = [i]
-                    val = parse_expr(tokens, pos)
-                    i = pos[0]
-                    if isinstance(val, float) and val.is_integer():
-                        output += str(int(val))
-                    else:
-                        output += str(val)
-            
-            print(output, end="" if suppress_newline else "\n")
-            return None
-
-        # LET (explicit or implicit)
-        elif tok == TOKENS['LET']:
-            i += 1
-        
-        # Check for variable assignment (implicit LET)
-        if i < len(tokens):
-            var_tok = tokens[i]
-            if isinstance(var_tok, int) and 65 <= var_tok <= 90:
-                var = chr(var_tok)
+            if isinstance(t, str) and not t.endswith('$'):
+                output += t
                 i += 1
-                
-                # Check for array assignment
-                if i < len(tokens) and tokens[i] == TOKENS['(']:
-                    i += 1  # Skip (
-                    pos = [i]
-                    idx = int(parse_expr(tokens, pos))
-                    i = pos[0]
-                    if i >= len(tokens) or tokens[i] != TOKENS[')']:
-                        raise BasicError("Expected )")
-                    i += 1  # Skip )
-                    if i >= len(tokens) or tokens[i] != TOKENS['=']:
-                        raise BasicError("Expected =")
-                    i += 1  # Skip =
-                    pos = [i]
-                    val = parse_expr(tokens, pos)
-                    i = pos[0]
-                    
-                    if var not in ARRAYS:
-                        raise BasicError(f"Array {var} not dimensioned")
-                    if idx < 0 or idx >= len(ARRAYS[var]):
-                        raise BasicError(f"Array {var}({idx}) out of bounds")
-                    ARRAYS[var][idx] = val
-                    return None
-                
-                elif i < len(tokens) and tokens[i] == TOKENS['=']:
-                    i += 1  # Skip =
-                    pos = [i]
-                    val = parse_expr(tokens, pos)
-                    i = pos[0]
-                    VARS[var] = val
-                    return None
-
-        # INPUT
-        if tok == TOKENS['INPUT']:
-            i += 1
-            # Handle optional prompt string
-            if i < len(tokens) and isinstance(tokens[i], str) and tokens[i] not in TOKENS:
-                prompt = tokens[i]
-                print(prompt, end="")
+            elif isinstance(t, str) and t.endswith('$'):
+                output += STR_VARS.get(t, '')
                 i += 1
-                if i < len(tokens) and tokens[i] == TOKENS[';']:
-                    i += 1
-            
-            if i >= len(tokens):
-                raise BasicError("INPUT requires variable")
-                
-            var_tok = tokens[i]
-            if not (isinstance(var_tok, int) and 65 <= var_tok <= 90):
-                raise BasicError("Expected variable after INPUT")
+            elif isinstance(t, int) and 65 <= t <= 90:
+                val = VARS.get(chr(t), 0.0)
+                output += str(int(val)) if val.is_integer() else str(val)
+                i += 1
+            else:
+                pos = [i]
+                val = parse_expr(tokens, pos)
+                i = pos[0]
+                output += str(int(val)) if isinstance(val, float) and val.is_integer() else str(val)
+        print(output, end="" if suppress_newline else "\n")
+        logger.info("PRINT: %r", output)
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['LET']:
+        i += 1
+        if i >= len(tokens):
+            raise BasicError("LET missing variable")
+        var_tok = tokens[i]
+        var = None
+
+        # Numeric variable
+        if isinstance(var_tok, int) and 65 <= var_tok <= 90:
             var = chr(var_tok)
             i += 1
-            
-            try:
-                user_val = input("? " if 'prompt' not in locals() else "")
-                VARS[var] = float(user_val)
-            except ValueError:
-                raise BasicError("Invalid numeric input")
-            except EOFError:
-                raise BasicError("Input interrupted")
-            return None
-
-        # DIM
-        elif tok == TOKENS['DIM']:
-            i += 1
-            while i < len(tokens):
-                if not (isinstance(tokens[i], int) and 65 <= tokens[i] <= 90):
-                    raise BasicError("Expected array variable")
-                var = chr(tokens[i])
+            if i < len(tokens) and tokens[i] == TOKENS['(']:
+                # Array element
                 i += 1
-                
-                if i >= len(tokens) or tokens[i] != TOKENS['(']:
-                    raise BasicError("Expected ( after array variable")
-                i += 1
-                
                 pos = [i]
-                size = int(parse_expr(tokens, pos))
+                idx = int(parse_expr(tokens, pos))
                 i = pos[0]
-                
                 if i >= len(tokens) or tokens[i] != TOKENS[')']:
                     raise BasicError("Expected )")
                 i += 1
-                
-                ARRAYS[var] = [0.0] * (size + 1)  # 0-based indexing, size+1 elements
-                
-                # Check for multiple arrays in one DIM statement
-                if i < len(tokens) and tokens[i] == TOKENS[',']:
-                    i += 1
-                else:
-                    break
-            return None
-
-        # READ
-        elif tok == TOKENS['READ']:
-            i += 1
-            while i < len(tokens):
-                if not (isinstance(tokens[i], int) and 65 <= tokens[i] <= 90):
-                    raise BasicError("Expected variable")
-                var = chr(tokens[i])
+                if i >= len(tokens) or tokens[i] != TOKENS['=']:
+                    raise BasicError("Expected =")
                 i += 1
-                
-                if DATA_PTR >= len(DATA_LINES):
-                    raise BasicError("Out of DATA")
-                    
-                data_val = DATA_LINES[DATA_PTR]
-                if isinstance(data_val, str):
+                pos = [i]
+                val = parse_expr(tokens, pos)
+                i = pos[0]
+                ARRAYS[var][idx] = val
+                logger.debug("LET array numeric: %s(%d) = %s", var, idx, val)
+            else:
+                # Simple variable
+                if i >= len(tokens) or tokens[i] != TOKENS['=']:
+                    raise BasicError("Expected =")
+                i += 1
+                pos = [i]
+                val = parse_expr(tokens, pos)
+                i = pos[0]
+                VARS[var] = val
+                logger.debug("LET numeric: %s = %s", var, val)
+
+        # String variable
+        elif isinstance(var_tok, str) and var_tok.endswith('$'):
+            var = var_tok
+            i += 1
+            if i < len(tokens) and tokens[i] == TOKENS['(']:
+                # String array element
+                i += 1
+                pos = [i]
+                idx = int(parse_expr(tokens, pos))
+                i = pos[0]
+                if i >= len(tokens) or tokens[i] != TOKENS[')']:
+                    raise BasicError("Expected )")
+                i += 1
+                if i >= len(tokens) or tokens[i] != TOKENS['=']:
+                    raise BasicError("Expected =")
+                i += 1
+                pos = [i]
+                val = parse_string(tokens, pos)
+                i = pos[0]
+                STR_ARRAYS[var][idx] = val
+                logger.debug("LET array string: %s(%d) = %r", var, idx, val)
+            else:
+                if i >= len(tokens) or tokens[i] != TOKENS['=']:
+                    raise BasicError("Expected =")
+                i += 1
+                pos = [i]
+                val = parse_string(tokens, pos)
+                i = pos[0]
+                STR_VARS[var] = val
+                logger.debug("LET string: %s = %r", var, val)
+        else:
+            raise BasicError(f"Invalid variable in LET: {var_tok}")
+
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['INPUT']:
+        i += 1
+        prompt = "?"
+        if i < len(tokens) and isinstance(tokens[i], str):
+            prompt = tokens[i]
+            i += 1
+            if i < len(tokens) and tokens[i] == TOKENS[';']:
+                i += 1
+        if i >= len(tokens):
+            raise BasicError("INPUT requires variable")
+        var_tok = tokens[i]
+        i += 1
+        if isinstance(var_tok, int) and 65 <= var_tok <= 90:
+            var = chr(var_tok)
+            user_val = input(prompt + " ")
+            VARS[var] = float(user_val)
+            logger.info("INPUT numeric: %s = %s", var, VARS[var])
+        elif isinstance(var_tok, str) and var_tok.endswith('$'):
+            var = var_tok
+            user_val = input(prompt + " ")
+            STR_VARS[var] = user_val
+            logger.info("INPUT string: %s = %r", var, user_val)
+        else:
+            raise BasicError("Invalid variable for INPUT")
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['DIM']:
+        i += 1
+        while i < len(tokens) and tokens[i] != TOKENS[':']:
+            var = tokens[i]
+            i += 1
+            if i >= len(tokens) or tokens[i] != TOKENS['(']:
+                raise BasicError("Expected ( after array variable")
+            i += 1
+            pos = [i]
+            size = int(parse_expr(tokens, pos))
+            i = pos[0]
+            if i >= len(tokens) or tokens[i] != TOKENS[')']:
+                raise BasicError("Expected )")
+            i += 1
+            if var.endswith('$'):
+                STR_ARRAYS[var] = [''] * (size + 1)
+                logger.debug("DIM string array: %s(%d)", var, size)
+            else:
+                ARRAYS[var] = [0.0] * (size + 1)
+                logger.debug("DIM numeric array: %s(%d)", var, size)
+            if i < len(tokens) and tokens[i] == TOKENS[',']:
+                i += 1
+            else:
+                break
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['READ']:
+        i += 1
+        while i < len(tokens) and tokens[i] != TOKENS[':']:
+            var_tok = tokens[i]
+            if isinstance(var_tok, int) and 65 <= var_tok <= 90:
+                var = chr(var_tok)
+                is_string_var = False
+            elif isinstance(var_tok, str) and var_tok.endswith('$'):
+                var = var_tok
+                is_string_var = True
+            else:
+                raise BasicError("Invalid variable for READ")
+            i += 1
+    
+            if DATA_PTR >= len(DATA_LINES):
+                raise BasicError("Out of DATA")
+    
+            # Extract value and is_string flag
+            data_val, is_string = DATA_LINES[DATA_PTR] if isinstance(DATA_LINES[DATA_PTR], tuple) else (DATA_LINES[DATA_PTR], isinstance(DATA_LINES[DATA_PTR], str))
+    
+            if is_string_var:
+                # Use data_val directly if it's a string, else convert
+                STR_VARS[var] = data_val if is_string else str(int(data_val)) if isinstance(data_val, float) and data_val.is_integer() else str(data_val)
+                logger.debug("READ string: %s = %r", var, STR_VARS[var])
+            else:
+                # Ensure numeric conversion
+                if is_string:
                     try:
                         VARS[var] = float(data_val)
                     except ValueError:
-                        VARS[var] = 0.0
+                        raise BasicError(f"Expected numeric DATA for {var}, got {data_val}")
                 else:
                     VARS[var] = float(data_val)
-                DATA_PTR += 1
-                
-                if i < len(tokens) and tokens[i] == TOKENS[',']:
-                    i += 1
-                else:
-                    break
-            return None
-
-        # RESTORE
-        elif tok == TOKENS['RESTORE']:
-            DATA_PTR = 0
-            return None
-
-        # FOR loop
-        elif tok == TOKENS['FOR']:
-            i += 1
-            if not (isinstance(tokens[i], int) and 65 <= tokens[i] <= 90):
-                raise BasicError("Expected variable after FOR")
-            var = chr(tokens[i])
-            i += 1
-            
-            if i >= len(tokens) or tokens[i] != TOKENS['=']:
-                raise BasicError("Expected = in FOR statement")
-            i += 1
-            
-            pos = [i]
-            start_val = parse_expr(tokens, pos)
-            i = pos[0]
-            
-            if i >= len(tokens) or tokens[i] != TOKENS['TO']:
-                raise BasicError("Expected TO in FOR statement")
-            i += 1
-            
-            pos = [i]
-            end_val = parse_expr(tokens, pos)
-            i = pos[0]
-            
-            step_val = 1.0
-            if i < len(tokens) and tokens[i] == TOKENS['STEP']:
-                i += 1
-                pos = [i]
-                step_val = parse_expr(tokens, pos)
-                i = pos[0]
-            
-            VARS[var] = start_val
-            FOR_STACK.append({
-                'var': var,
-                'end': end_val,
-                'step': step_val,
-                'line_num': None  # Will be set by the interpreter
-            })
-            return None
-
-        # NEXT
-        elif tok == TOKENS['NEXT']:
-            i += 1
-            next_var = None
-            if i < len(tokens) and isinstance(tokens[i], int) and 65 <= tokens[i] <= 90:
-                next_var = chr(tokens[i])
-                i += 1
-            
-            if not FOR_STACK:
-                raise BasicError("NEXT without FOR")
-            
-            loop_info = FOR_STACK[-1]
-            if next_var and next_var != loop_info['var']:
-                raise BasicError(f"NEXT {next_var} doesn't match FOR {loop_info['var']}")
-            
-            var = loop_info['var']
-            VARS[var] += loop_info['step']
-            
-            # Check if loop should continue
-            if ((loop_info['step'] > 0 and VARS[var] <= loop_info['end']) or
-                (loop_info['step'] < 0 and VARS[var] >= loop_info['end'])):
-                # Continue loop - return to line after FOR
-                return ('FOR_CONTINUE', loop_info['line_num'])
-            else:
-                # End loop
-                FOR_STACK.pop()
-                return None
-
-        # GOSUB
-        elif tok == TOKENS['GOSUB']:
-            i += 1
-            if i >= len(tokens):
-                raise BasicError("GOSUB requires line number")
-            target = int(tokens[i])
-            GOSUB_STACK.append(None)  # Will be set by interpreter
-            return ('GOSUB', target)
-
-        # RETURN
-        elif tok == TOKENS['RETURN']:
-            if not GOSUB_STACK:
-                raise BasicError("RETURN without GOSUB")
-            return_line = GOSUB_STACK.pop()
-            return ('RETURN', return_line)
-
-        # GOTO
-        elif tok == TOKENS['GOTO']:
-            i += 1
-            if i >= len(tokens):
-                raise BasicError("GOTO requires line number")
-            target = int(tokens[i])
-            return ('GOTO', target)
-
-        # IF ... THEN
-        elif tok == TOKENS['IF']:
-            i += 1
-            # Collect condition tokens
-            cond_tokens = []
-            while i < len(tokens) and tokens[i] != TOKENS['THEN']:
-                cond_tokens.append(tokens[i])
-                i += 1
-            
-            if i >= len(tokens) or tokens[i] != TOKENS['THEN']:
-                raise BasicError("Expected THEN")
-            i += 1
-            
-            if i >= len(tokens):
-                raise BasicError("Expected line number or statement after THEN")
-            
-            pos = [0]
-            cond_val = parse_rel(cond_tokens, pos)
-            
-            if cond_val != 0:  # Condition is true
-                # Check if it's a line number or a statement
-                if isinstance(tokens[i], float) and tokens[i].is_integer():
-                    return ('GOTO', int(tokens[i]))
-                else:
-                    # Execute the rest of the line
-                    return execute_line(tokens[i:])
-            return None
-
-        # END
-        elif tok == TOKENS['END']:
-            return ('END',)
-
-        # DATA (skip - already processed)
-        elif tok == TOKENS['DATA']:
-            return None
-
-        else:
-            i += 1
+                logger.debug("READ numeric: %s = %s", var, VARS[var])
     
+            DATA_PTR += 1
+    
+            if i < len(tokens) and tokens[i] == TOKENS[',']:
+                i += 1
+            else:
+                break
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['RESTORE']:
+        DATA_PTR = 0
+        logger.debug("RESTORE: DATA_PTR reset to 0")
+        i_pos[0] = len(tokens)
+        return None
+
+    # FOR/NEXT logging
+    elif tok == TOKENS['FOR']:
+        i += 1
+        var = chr(tokens[i])
+        i += 1
+        i += 1  # Skip '='
+        pos = [i]
+        start_val = parse_expr(tokens, pos)
+        i = pos[0]
+        i += 1  # Skip TO
+        pos = [i]
+        end_val = parse_expr(tokens, pos)
+        i = pos[0]
+        step_val = 1.0
+        if i < len(tokens) and tokens[i] == TOKENS['STEP']:
+            i += 1
+            pos = [i]
+            step_val = parse_expr(tokens, pos)
+            i = pos[0]
+        VARS[var] = start_val
+        FOR_STACK.append({'var': var, 'end': end_val, 'step': step_val, 'line_num': None})
+        logger.debug("FOR loop: %s = %s TO %s STEP %s", var, start_val, end_val, step_val)
+        i_pos[0] = i
+        return None
+
+    elif tok == TOKENS['NEXT']:
+        i += 1
+        next_var = chr(tokens[i]) if i < len(tokens) else None
+        loop_info = FOR_STACK[-1]
+        var = loop_info['var']
+        VARS[var] += loop_info['step']
+        if ((loop_info['step'] > 0 and VARS[var] <= loop_info['end']) or
+            (loop_info['step'] < 0 and VARS[var] >= loop_info['end'])):
+            i_pos[0] = i
+            logger.debug("NEXT %s: continue loop, new value = %s", var, VARS[var])
+            return ('FOR_CONTINUE', loop_info['line_num'])
+        else:
+            FOR_STACK.pop()
+            i_pos[0] = i
+            logger.debug("NEXT %s: loop finished", var)
+            return None
+
+    # GOTO/GOSUB/RETURN logging
+    elif tok == TOKENS['GOTO']:
+        i += 1
+        target = int(tokens[i])
+        logger.debug("GOTO line %s", target)
+        i_pos[0] = len(tokens)
+        return ('GOTO', target)
+
+    elif tok == TOKENS['GOSUB']:
+        i += 1
+        target = int(tokens[i])
+        GOSUB_STACK.append(None)
+        logger.debug("GOSUB line %s", target)
+        i_pos[0] = len(tokens)
+        return ('GOSUB', target)
+
+    elif tok == TOKENS['RETURN']:
+        return_line = GOSUB_STACK.pop()
+        logger.debug("RETURN to line %s", return_line)
+        i_pos[0] = len(tokens)
+        return ('RETURN', return_line)
+
+    elif tok == TOKENS['END']:
+        logger.debug("END statement")
+        i_pos[0] = len(tokens)
+        return ('END',)
+
+    elif tok == TOKENS['DATA']:
+        logger.debug("DATA statement ignored during execution")
+        i_pos[0] = len(tokens)
+        return None
+
+    elif tok == TOKENS['POKE']:
+        i += 1
+        i += 1  # Skip '('
+        pos = [i]
+        addr = int(parse_expr(tokens, pos))
+        i = pos[0]
+        i += 1  # Skip ','
+        pos = [i]
+        val = int(parse_expr(tokens, pos))
+        i = pos[0]
+        MEMORY[addr] = val
+        logger.debug("POKE memory[%d] = %d", addr, val)
+        i_pos[0] = i + 1
+        return None
+
+    else:
+        raise BasicError(f"Invalid statement starting with {tok}")
+
+def execute_line(tokens):
+    i_pos = [0]
+    while i_pos[0] < len(tokens):
+        result = execute_statement(tokens, i_pos)
+        if result is not None:
+            return result
+        if i_pos[0] < len(tokens) and tokens[i_pos[0]] == TOKENS[':']:
+            i_pos[0] += 1
     return None
 
 def run_program():
-    global DATA_PTR, GOSUB_STACK, FOR_STACK
-    DATA_PTR = 0  # Reset on RUN
+    global DATA_PTR, GOSUB_STACK, FOR_STACK, TERM_WIDTH
+    DATA_PTR = 0
     GOSUB_STACK = []
     FOR_STACK = []
+    
+    try:
+        TERM_WIDTH = os.get_terminal_size().columns
+    except:
+        TERM_WIDTH = 80
     
     lines_sorted = sorted(LINES.keys())
     if not lines_sorted: 
@@ -579,7 +786,6 @@ def run_program():
         line_num = lines_sorted[pc]
         tokens = LINES[line_num]
         
-        # Set current line for FOR loops
         for loop in FOR_STACK:
             if loop['line_num'] is None:
                 loop['line_num'] = line_num
@@ -609,7 +815,7 @@ def run_program():
                 if target not in LINES:
                     print(f"ERROR: Line {target} not found")
                     return
-                GOSUB_STACK[-1] = line_num  # Set return address
+                GOSUB_STACK[-1] = lines_sorted[pc]
                 pc = lines_sorted.index(target)
                 continue
                 
@@ -623,12 +829,13 @@ def run_program():
                 
             elif cmd == 'FOR_CONTINUE':
                 target = result[1]
-                pc = lines_sorted.index(target)
+                pc = lines_sorted.index(target) + 1
                 continue
         
         pc += 1
 
 def main():
+    global DATA_LINES, DATA_PTR, GOSUB_STACK, FOR_STACK
     print("PYTHON-M6502 Interpreter")
     print("Commands: RUN, LIST, NEW, SAVE, LOAD, QUIT")
     print("Ready.")
@@ -645,7 +852,6 @@ def main():
 
         upper = line.upper().strip()
         
-        # Commands
         if upper == "RUN":
             try: 
                 run_program()
@@ -663,20 +869,15 @@ def main():
         elif upper == "NEW":
             LINES.clear()
             for k in VARS: VARS[k] = 0.0
+            for k in STR_VARS: STR_VARS[k] = ''
             ARRAYS.clear()
-            
-            # Reset all interpreter state
+            STR_ARRAYS.clear()
             global DATA_LINES, DATA_PTR, GOSUB_STACK, FOR_STACK
             DATA_LINES = []
             DATA_PTR = 0
             GOSUB_STACK = []
             FOR_STACK = []
-            
             print("Ready.")
-            
-        elif upper == "QUIT" or upper == "EXIT":
-            print("Goodbye!")
-            break
             
         elif upper.startswith("SAVE"):
             parts = line.split(None, 1)
@@ -686,6 +887,8 @@ def main():
                     for num in sorted(LINES.keys()):
                         f.write(f"{num} {detokenize(LINES[num])}\n")
                 print(f"Saved as {filename}.bas")
+            except PermissionError:
+                print("SAVE ERROR: Permission denied")
             except Exception as e:
                 print(f"SAVE ERROR: {e}")
                 
@@ -695,11 +898,13 @@ def main():
             if not filename.endswith('.bas'):
                 filename += '.bas'
             try:
-                # Clear current program
                 LINES.clear()
                 for k in VARS: 
                     VARS[k] = 0.0
+                for k in STR_VARS:
+                    STR_VARS[k] = ''
                 ARRAYS.clear()
+                STR_ARRAYS.clear()
                 DATA_LINES = []
                 DATA_PTR = 0
                 GOSUB_STACK = []
@@ -711,17 +916,18 @@ def main():
                         if line_text: parse_line(line_text)
                 print(f"Loaded {filename}")
             except FileNotFoundError: print(f"FILE NOT FOUND: {filename}")
+            except PermissionError:
+                print("LOAD ERROR: Permission denied")
             except Exception as e: print(f"LOAD ERROR: {e}")
         
-        # Program line
         elif re.match(r'^\d+', line):
             try:  parse_line(line)
             except BasicError as e: print(f"SYNTAX ERROR: {e}")
                 
-        # Direct mode execution
         else:
             try: 
-                result = execute_line(tokenize(line))
+                tokens = tokenize(line)
+                result = execute_line(tokens)
                 if isinstance(result, tuple) and result[0] == 'END':
                     print("Ready.")
             except BasicError as e:  print(f"ERROR: {e}")
