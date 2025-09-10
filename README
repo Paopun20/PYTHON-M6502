@@ -1,2 +1,58 @@
-Just Port From https://github.com/microsoft/BASIC-M6502/ but Python
-yes, have a lot of bugs
+# Python-M6502 Interpreter
+
+A Python port of Microsoft's [BASIC-M6502](https://github.com/microsoft/BASIC-M6502/), an interpreter for a BASIC-like language simulating a 6502 microprocessor environment.
+
+## Features
+- Executes BASIC programs with commands: `RUN`, `LIST`, `NEW`, `SAVE`, `LOAD`, `QUIT`.
+- Supports statements: `PRINT`, `LET`, `INPUT`, `DIM`, `READ`, `RESTORE`, `FOR`, `NEXT`, `GOTO`, `GOSUB`, `RETURN`, `DATA`, `REM`, `POKE`, `PEEK`.
+- Functions: `SIN`, `COS`, `ABS`, `SQR`, `RND`, `LEN`, `CHR$`, `ASC`, `LEFT$`, `RIGHT$`, `MID$`.
+- Simulates 64KB 6502 memory.
+- Logging with `rich` for console and file output (`m6502.log`).
+
+## Usage
+1. Run `m6502.py`:
+   ```bash
+   python m6502.py
+   ```
+2. At the prompt (`>`), use commands:
+   - `RUN`: Execute the program.
+   - `LIST`: Display program lines.
+   - `NEW`: Clear program and variables.
+   - `SAVE <filename>`: Save program to `<filename>.bas`.
+   - `LOAD <filename>`: Load program from `<filename>.bas`.
+   - `QUIT`: Exit the interpreter.
+3. Enter lines like `10 PRINT "HELLO"` to build a program.
+
+## Example
+```
+> 10 DATA 42, "HELLO"
+> 20 READ A
+> 30 PRINT A
+> 40 RESTORE
+> 50 READ B$
+> 60 PRINT B$
+> 70 END
+> RUN
+42
+HELLO
+Ready.
+```
+
+## Installation
+1. Clone or download this repository.
+2. Install dependencies:
+   ```bash
+   pip install rich
+   ```
+3. Run the interpreter:
+   ```bash
+   python m6502.py
+   ```
+
+## Notes
+- This is a port of Microsoft's BASIC-M6502 with ongoing bug fixes.
+- Known issues: Some type handling in `READ` and `PRINT` may need refinement.
+- Report bugs or contribute fixes via pull requests.
+
+## License
+This project is licensed under the MIT License, as per the original [BASIC-M6502](https://github.com/microsoft/BASIC-M6502/) repository. See `LICENSE` for details.
